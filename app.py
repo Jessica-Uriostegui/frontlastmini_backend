@@ -1,3 +1,4 @@
+import os
 from flask import Flask, jsonify, request #imports flask and allows us to instantiate an app
 from flask_sqlalchemy import SQLAlchemy # this is Object Relational Mapper
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session # this is a class that all of our classes will inherit
@@ -6,15 +7,19 @@ from sqlalchemy import select, delete #query our database with a select statemen
 from flask_marshmallow import Marshmallow # creates our schema to validate incoming and outgoing data
 from flask_cors import CORS # Cross Origin Resource Sharing - allows our application to be accessed by 3rd parties
 import datetime
+import jwt
 from typing import List #tie a one to many relationship back to the one
 from marshmallow import ValidationError, fields, validate, Schema
+from werkzeug.security import generate_password_hash, check_password_hash
+
 
 
 
 
 app = Flask(__name__)
 CORS(app) #initializes CORS for our application
-app.config["SQLALCHEMY_DATABASE_URI"] = "mysql+mysqlconnector://root:Dolphin25!@localhost/e_commerce_db2"
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv('DATABASE_URL')
+#app.config["SQLALCHEMY_DATABASE_URI"] = "mysql+mysqlconnector://root:Dolphin25!@localhost/e_commerce_db2"
 #  'mysql+mysqlconnector://root:your_password@localhost/e_commerce_db'
 #                           user  password                database name
 
@@ -56,7 +61,13 @@ class CustomerAccount(Base):
     customer_id: Mapped[int] = mapped_column(db.ForeignKey('Customers.customer_id'))
     # create the back reference relationship between objects of the classes
     customer: Mapped["Customer"] = db.relationship(back_populates="customer_account")
+     
+    def set_password(self, password: str):
+        self.password = generate_password_hash(password)
 
+    def check_password(self, password: str) -> bool:
+        return check_password_hash(self.password, password)
+    
 # associate table between orders and products to manage the many to many relationship
 order_product = db.Table(
     "Order_Product", #association table name
@@ -109,6 +120,24 @@ customers_schema = CustomerSchema(many=True)
 # ======================================== API ROUTES ======================================================
 # CUSTOMERS
 # get all customers
+@app.route("/register", methods=["POST"])
+def register():
+    try:
+        data = account_schema.load(request.json)
+    except ValidationError as e:
+        return jsonify(e.messages), 400
+    
+    with Session(db.engine) as session:
+        account = session.query(CustomerAccount).filter_by(username=data['username']).first()
+        if account and account.check_password(data['password']):
+            token = jwt.encode({
+                'username': account.username,
+                'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+            }, 'SECRET_KEY', algorithm='HS256')
+            return jsonify({'token': token}), 200
+        
+        return jsonify({'error': 'Invalid username or password'}), 401
+
 @app.route("/customers", methods = ["GET"])
 def get_customers():
     query = select(Customer) #using the select method from our ORM(SQLAlchemy) 
@@ -374,22 +403,29 @@ class OrderSchema(Schema):
 order_schema = OrderSchema()
 orders_schema = OrderSchema(many=True)
 
+
 @app.route("/orders", methods=["GET"])
 def get_orders():
-    query = select(Order)
-    result = db.session.execute(query).scalars().all()
-    orders_with_products = []
+    try:
+        query = select(Order)
+        with Session(db.engine) as session:
+            orders = session.execute(query).scalars().all()
+            
+            # Manually serialize orders to handle related objects
+            orders_list = []
+            for order in orders:
+                order_dict = {
+                    "order_id": order.order_id,
+                    "customer_id": order.customer_id,
+                    "date": order.date,
+                    "products": [product.product_id for product in order.products]  # Convert Product objects to IDs
+                }
+                orders_list.append(order_dict)
+            
+            return jsonify(orders_list)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    for order in result:
-        order_dict = {
-            "order_id": order.order_id,
-            "customer_id": order.customer_id,
-            "date": order.date,
-            "products": [product.product_id for product in order.products]
-        }
-        orders_with_products.append(order_dict)
-
-    return jsonify(orders_with_products)
 
 @app.route("/orders", methods=["POST"])
 def add_order():
@@ -398,31 +434,38 @@ def add_order():
     except ValidationError as err:
         return jsonify(err.messages), 400
     
-    product_ids = order_data.get('products', [])  # Ensure key is 'products' matching the schema
+    try:
+        with Session(db.engine) as session:
+            # Check if the customer exists
+            customer_query = select(Customer).filter(Customer.customer_id == order_data['customer_id'])
+            customer = session.execute(customer_query).scalar()
+            if not customer:
+                return jsonify({"error": "Customer not found"}), 404
 
-    # Start by ensuring the customer exists
-    with Session(db.engine) as session:
-        customer = session.query(Customer).get(order_data['customer_id'])
-        if not customer:
-            return jsonify({"error": "Customer not found"}), 404
+            new_order = Order(
+                customer_id=order_data['customer_id'],
+                date=order_data['date']
+            )
+            # Add products if provided
+            for product_id in order_data.get('products', []):
+                product = session.execute(select(Product).filter(Product.product_id == product_id)).scalar()
+                if product:
+                    new_order.products.append(product)
+                else:
+                    return jsonify({"error": f"Product with ID {product_id} not found"}), 404
+            
+            session.add(new_order)
+            session.commit()
+        return jsonify({"message": "Order added successfully!"}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
         
-        new_order = Order(
-            customer_id=order_data['customer_id'],
-            date=order_data['date']
-        )
+        
+            
+        
 
-        for product_id in product_ids:
-            product = session.query(Product).get(product_id)
-            if product:
-                new_order.products.append(product)
-            else:
-                return jsonify({"error": f"Product with ID {product_id} not found"}), 404
-
-        session.add(new_order)
-        session.commit()
-
-    return jsonify({"message": "Order added successfully!"}), 201
-
+        
+ 
 @app.route('/orders/<int:order_id>', methods=["PUT"])
 def update_order(order_id):
     try:
